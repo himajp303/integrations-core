@@ -12,7 +12,7 @@ from math import ceil
 
 # project
 from checks import AgentCheck
-from config import _is_affirmative
+from config import _is_affirmative, get_histogram_submit_methods
 from utils.dockerutil import (DockerUtil,
                               MountException,
                               BogusPIDException,
@@ -37,12 +37,6 @@ DISK_STATS_RE = re.compile('([0-9.]+)\s?([a-zA-Z]+)')
 
 GAUGE = AgentCheck.gauge
 RATE = AgentCheck.rate
-HISTORATE = AgentCheck.generate_historate_func(["container_name"])
-HISTO = AgentCheck.generate_histogram_func(["container_name"])
-FUNC_MAP = {
-    GAUGE: {True: HISTO, False: GAUGE},
-    RATE: {True: HISTORATE, False: RATE}
-}
 
 UNIT_MAP = {
     'kb': 1000,
@@ -172,6 +166,12 @@ class DockerDaemon(AgentCheck):
         self.docker_client = None
         self._service_discovery = agentConfig.get('service_discovery') and \
             agentConfig.get('service_discovery_backend') == 'docker'
+
+        # Handle use_histogram and compute submission methods
+        self.use_histogram = _is_affirmative(instances[0].get('use_histogram', False))
+        self._submit = get_histogram_submit_methods(
+            use_histogram=self.use_histogram,
+            tags_to_strip=agentConfig.get('docker_histo_striptags'))
         self.init()
 
     def init(self):
@@ -205,7 +205,6 @@ class DockerDaemon(AgentCheck):
             self.collect_labels_as_tags = instance.get("collect_labels_as_tags", DEFAULT_LABELS_AS_TAGS)
             self.kube_pod_tags = {}
 
-            self.use_histogram = _is_affirmative(instance.get('use_histogram', False))
             performance_tags = instance.get("performance_tags", DEFAULT_PERFORMANCE_TAGS)
 
             self.tag_names = {
@@ -228,7 +227,6 @@ class DockerDaemon(AgentCheck):
                 patterns, whitelist_tags = compile_filter_rules(health_scs_whitelist)
                 self.whitelist_patterns = set(patterns)
                 self.tag_names[HEALTHCHECK] = set(whitelist_tags)
-
 
             # Other options
             self.collect_image_stats = _is_affirmative(instance.get('collect_images_stats', False))
@@ -537,7 +535,7 @@ class DockerDaemon(AgentCheck):
                 continue
 
             tags = self._get_tags(container, PERFORMANCE)
-            m_func = FUNC_MAP[GAUGE][self.use_histogram]
+            m_func = self._submit[GAUGE]
             if "SizeRw" in container:
                 m_func(self, 'docker.container.size_rw', container['SizeRw'],
                        tags=tags)
@@ -577,7 +575,7 @@ class DockerDaemon(AgentCheck):
 
     def _report_container_count(self, containers_by_id):
         """Report container count per state"""
-        m_func = FUNC_MAP[GAUGE][self.use_histogram]
+        m_func = self._submit[GAUGE]
 
         per_state_count = defaultdict(int)
 
@@ -593,7 +591,7 @@ class DockerDaemon(AgentCheck):
 
     def _report_volume_count(self):
         """Report volume count per state (dangling or not)"""
-        m_func = FUNC_MAP[GAUGE][self.use_histogram]
+        m_func = self._submit[GAUGE]
 
         attached_volumes = self.docker_client.volumes(filters={'dangling': False})
         dangling_volumes = self.docker_client.volumes(filters={'dangling': True})
@@ -659,7 +657,7 @@ class DockerDaemon(AgentCheck):
                 stats = self._parse_cgroup_file(stat_file)
                 if stats:
                     for key, (dd_key, metric_func) in cgroup['metrics'].iteritems():
-                        metric_func = FUNC_MAP[metric_func][self.use_histogram]
+                        metric_func = self._submit[metric_func]
                         if key in stats:
                             metric_func(self, dd_key, int(stats[key]), tags=tags)
 
@@ -670,7 +668,7 @@ class DockerDaemon(AgentCheck):
                             self.log.debug("Couldn't compute {0}, some keys were missing.".format(mname))
                             continue
                         value = fct(*values)
-                        metric_func = FUNC_MAP[metric_func][self.use_histogram]
+                        metric_func = self._submit[metric_func]
                         if value is not None:
                             metric_func(self, mname, value, tags=tags)
 
@@ -710,7 +708,7 @@ class DockerDaemon(AgentCheck):
                     if interface_name in networks:
                         net_tags = tags + ['docker_network:'+networks[interface_name]]
                         x = cols[1].split()
-                        m_func = FUNC_MAP[RATE][self.use_histogram]
+                        m_func = self._submit[RATE]
                         m_func(self, "docker.net.bytes_rcvd", long(x[0]), net_tags)
                         m_func(self, "docker.net.bytes_sent", long(x[8]), net_tags)
 
